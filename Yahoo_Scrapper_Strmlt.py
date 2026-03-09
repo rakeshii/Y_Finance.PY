@@ -518,7 +518,7 @@ with st.sidebar:
     st.markdown("""
     <div style='font-family: Space Mono, monospace; font-size: 0.7rem; color: #3a5a7a; line-height: 1.8;'>
     ℹ️ Supports any Yahoo Finance ticker<br>
-    🇮🇳 Indian stocks: add .NS (NSE) or .BO (BSE)<br>
+    🇮🇳 Indian stocks: add .NS (NSE) or .BO (BSE)<brko>
     📦 One Excel file per ticker<br>
     ⚡ Data cached for 1 hour<br>
     </div>
