@@ -219,6 +219,7 @@ section[data-testid="stSidebar"] {
 }
 .status-box.success { border-left-color: #69f0ae; color: #69f0ae; }
 .status-box.error   { border-left-color: #ff5252; color: #ff5252; }
+.status-box.warning { border-left-color: #ffb300; color: #ffb300; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -234,11 +235,16 @@ ANALYSIS_SECTION_NAMES = [
     "EPS Trend", "EPS Revisions", "Growth Estimates",
 ]
 
+# ========== RATE LIMIT CONFIG ==========
+INTER_TICKER_DELAY   = 3.0   # seconds between tickers
+RETRY_DELAYS         = [5, 15, 30]  # exponential back-off per attempt
+SCRAPE_DELAY         = 2.0   # seconds between the two scrape calls per ticker
+
 # ========== SCRAPING ==========
 def safe_df(df):
     return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
-def scrape_yahoo_sections(url, section_names=None, retries=3, delay=5):
+def scrape_yahoo_sections(url, section_names=None, retries=3):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -247,7 +253,7 @@ def scrape_yahoo_sections(url, section_names=None, retries=3, delay=5):
     }
     for attempt in range(retries):
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
             sections = []
@@ -270,18 +276,82 @@ def scrape_yahoo_sections(url, section_names=None, retries=3, delay=5):
                 if rows:
                     sections.append((heading, pd.DataFrame(rows)))
             return sections
-        except Exception as e:
-            time.sleep(delay)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                wait = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                time.sleep(wait)
+            else:
+                break
+        except Exception:
+            wait = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+            time.sleep(wait)
     return []
 
+# ========== CACHED DATA FETCHERS ==========
+# TTL = 3600 seconds (1 hour) — data won't be re-fetched on every Streamlit rerun
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ticker_data(ticker: str):
+    """Fetch all yfinance data for a ticker. Cached for 1 hour."""
+    for attempt in range(3):
+        try:
+            stock = yf.Ticker(ticker)
+
+            history_df = safe_df(stock.history(period="1y"))
+            if not history_df.empty:
+                try:
+                    history_df.index = history_df.index.tz_localize(None)
+                except Exception:
+                    history_df.index = history_df.index.tz_convert(None)
+                history_df = history_df.sort_index(ascending=False)
+
+            balance_sheet_df = safe_df(stock.balance_sheet)
+            financials_df    = safe_df(stock.financials)
+            cashflow_df      = safe_df(stock.cashflow)
+            info             = stock.info or {}
+
+            return {
+                "history":       history_df,
+                "balance_sheet": balance_sheet_df,
+                "financials":    financials_df,
+                "cashflow":      cashflow_df,
+                "info":          info,
+                "error":         None,
+            }
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "Too Many Requests" in err_str or "Rate" in err_str:
+                wait = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                time.sleep(wait)
+            else:
+                return {"error": err_str}
+    return {"error": "Rate limited after 3 retries. Please wait a few minutes and try again."}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_scraped_sections(ticker: str, include_analysis: bool):
+    """Scrape Yahoo Finance statistics & analysis pages. Cached for 1 hour."""
+    stats_url    = f"https://finance.yahoo.com/quote/{ticker}/key-statistics"
+    analysis_url = f"https://finance.yahoo.com/quote/{ticker}/analysis"
+
+    stats_sections = scrape_yahoo_sections(stats_url, STATS_SECTION_NAMES)
+
+    # Small delay between the two HTTP requests to avoid hammering Yahoo
+    time.sleep(SCRAPE_DELAY)
+
+    analysis_sections = []
+    if include_analysis:
+        analysis_sections = scrape_yahoo_sections(analysis_url, ANALYSIS_SECTION_NAMES)
+
+    return stats_sections, analysis_sections
+
+
 # ========== EXCEL BUILDER ==========
-def build_excel(ticker, stock, history_df, balance_sheet_df,
+def build_excel(ticker, history_df, balance_sheet_df,
                 financials_df, cashflow_df,
                 yahoo_stats_sections, yahoo_analysis_sections):
     buf = io.BytesIO()
 
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # Price History
         if not history_df.empty:
             h = history_df.round(2)
             h.to_excel(writer, sheet_name="Price_History")
@@ -368,7 +438,6 @@ def make_financials_chart(financials_df, ticker):
     available = [r for r in rows if r in financials_df.index]
     if not available:
         return None
-
     df = financials_df.loc[available].T / 1e9
     df.index = [str(c)[:10] for c in df.index]
     colors = ["#4fc3f7", "#69f0ae", "#ff9800"]
@@ -451,6 +520,7 @@ with st.sidebar:
     ℹ️ Supports any Yahoo Finance ticker<br>
     🇮🇳 Indian stocks: add .NS (NSE) or .BO (BSE)<br>
     📦 One Excel file per ticker<br>
+    ⚡ Data cached for 1 hour<br>
     </div>
     """, unsafe_allow_html=True)
 
@@ -463,7 +533,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if not fetch_btn:
-    # Landing state
     col1, col2, col3 = st.columns(3)
     for col, icon, title, desc in [
         (col1, "📥", "Excel Export", "All sheets: Price History, Balance Sheet, Income Statement, Cashflow, Key Statistics, Analysis"),
@@ -494,47 +563,71 @@ else:
         st.error("Please enter at least one ticker symbol.")
         st.stop()
 
-    st.markdown(f"**Fetching:** " + " ".join([f"<span class='ticker-badge'>{t}</span>" for t in tickers]), unsafe_allow_html=True)
+    st.markdown(
+        "**Fetching:** " + " ".join([f"<span class='ticker-badge'>{t}</span>" for t in tickers]),
+        unsafe_allow_html=True
+    )
     st.markdown("")
 
-    for ticker in tickers:
+    for idx, ticker in enumerate(tickers):
         st.markdown(f"<div class='section-title'>📌 {ticker}</div>", unsafe_allow_html=True)
         log = st.empty()
 
+        # ── Add inter-ticker delay (skip for the very first ticker) ──
+        if idx > 0:
+            log.markdown(
+                f"<div class='status-box warning'>⏳ Waiting {INTER_TICKER_DELAY}s before next request to avoid rate limits...</div>",
+                unsafe_allow_html=True
+            )
+            time.sleep(INTER_TICKER_DELAY)
+
         try:
-            log.markdown(f"<div class='status-box'>⏳ Connecting to Yahoo Finance for {ticker}...</div>", unsafe_allow_html=True)
-            stock = yf.Ticker(ticker)
+            log.markdown(
+                f"<div class='status-box'>⏳ Fetching yfinance data for {ticker}...</div>",
+                unsafe_allow_html=True
+            )
 
-            history_df = safe_df(stock.history(period="1y"))
-            if not history_df.empty:
-                if hasattr(history_df.index, "tz_localize"):
-                    try: history_df.index = history_df.index.tz_localize(None)
-                    except: history_df.index = history_df.index.tz_convert(None)
-                history_df = history_df.sort_index(ascending=False)
+            # ── Cached yfinance call ──
+            result = fetch_ticker_data(ticker)
 
-            balance_sheet_df = safe_df(stock.balance_sheet)
-            financials_df    = safe_df(stock.financials)
-            cashflow_df      = safe_df(stock.cashflow)
-            info             = stock.info or {}
+            if result.get("error"):
+                log.markdown(
+                    f"<div class='status-box error'>❌ Failed for {ticker}: {result['error']}</div>",
+                    unsafe_allow_html=True
+                )
+                st.markdown("<br>", unsafe_allow_html=True)
+                continue
 
-            log.markdown(f"<div class='status-box'>⏳ Scraping Key Statistics page...</div>", unsafe_allow_html=True)
-            stats_url    = f"https://finance.yahoo.com/quote/{ticker}/key-statistics"
-            analysis_url = f"https://finance.yahoo.com/quote/{ticker}/analysis"
-            yahoo_stats_sections    = scrape_yahoo_sections(stats_url,    STATS_SECTION_NAMES)
-            yahoo_analysis_sections = scrape_yahoo_sections(analysis_url, ANALYSIS_SECTION_NAMES) if include_analysis else []
+            history_df       = result["history"]
+            balance_sheet_df = result["balance_sheet"]
+            financials_df    = result["financials"]
+            cashflow_df      = result["cashflow"]
+            info             = result["info"]
 
-            log.markdown(f"<div class='status-box success'>✅ Data fetched successfully for {ticker}</div>", unsafe_allow_html=True)
+            log.markdown(
+                f"<div class='status-box'>⏳ Scraping Key Statistics page for {ticker}...</div>",
+                unsafe_allow_html=True
+            )
 
-            # ---- KEY METRICS ROW ----
-            price   = info.get("currentPrice") or info.get("regularMarketPrice", "N/A")
-            mktcap  = info.get("marketCap", 0)
+            # ── Cached scrape call ──
+            yahoo_stats_sections, yahoo_analysis_sections = fetch_scraped_sections(
+                ticker, include_analysis
+            )
+
+            log.markdown(
+                f"<div class='status-box success'>✅ Data fetched successfully for {ticker}</div>",
+                unsafe_allow_html=True
+            )
+
+            # ── KEY METRICS ROW ──
+            price      = info.get("currentPrice") or info.get("regularMarketPrice", "N/A")
+            mktcap     = info.get("marketCap", 0)
             mktcap_str = f"${mktcap/1e9:.2f}B" if mktcap else "N/A"
-            pe      = info.get("trailingPE", "N/A")
-            change  = info.get("regularMarketChangePercent", None)
+            pe         = info.get("trailingPE", "N/A")
+            change     = info.get("regularMarketChangePercent", None)
             change_str = f"{change*100:+.2f}%" if change else "N/A"
-            sector  = info.get("sector", "N/A")
-
-            cls = "positive" if (change or 0) >= 0 else "negative"
+            sector     = info.get("sector", "N/A")
+            cls        = "positive" if (change or 0) >= 0 else "negative"
 
             st.markdown(f"""
             <div class='metric-grid'>
@@ -561,12 +654,11 @@ else:
             </div>
             """, unsafe_allow_html=True)
 
-            # ---- CHARTS ----
+            # ── CHARTS ──
             if include_charts and not history_df.empty:
                 tab1, tab2, tab3 = st.tabs(["📈 Price & Volume", "💰 Revenue & Profit", "🏦 Balance Sheet"])
                 with tab1:
-                    fig = make_price_chart(history_df, ticker)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(make_price_chart(history_df, ticker), use_container_width=True)
                 with tab2:
                     fig2 = make_financials_chart(financials_df, ticker)
                     if fig2: st.plotly_chart(fig2, use_container_width=True)
@@ -576,13 +668,12 @@ else:
                     if fig3: st.plotly_chart(fig3, use_container_width=True)
                     else:    st.info("Balance sheet data not available.")
 
-            # ---- BUILD EXCEL ----
+            # ── BUILD & DOWNLOAD EXCEL ──
             excel_buf = build_excel(
-                ticker, stock, history_df,
+                ticker, history_df,
                 balance_sheet_df, financials_df, cashflow_df,
                 yahoo_stats_sections, yahoo_analysis_sections
             )
-
             fname = f"{ticker.replace('.','_')}_YahooFinance_{datetime.now().strftime('%Y%m%d')}.xlsx"
             st.download_button(
                 label=f"⬇️  Download {ticker} Excel",
@@ -593,6 +684,9 @@ else:
             )
 
         except Exception as e:
-            log.markdown(f"<div class='status-box error'>❌ Failed for {ticker}: {e}</div>", unsafe_allow_html=True)
+            log.markdown(
+                f"<div class='status-box error'>❌ Failed for {ticker}: {e}</div>",
+                unsafe_allow_html=True
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
