@@ -7,7 +7,7 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -290,24 +290,27 @@ def scrape_yahoo_sections(url, section_names=None, retries=3):
 # ========== CACHED DATA FETCHERS ==========
 # TTL = 3600 seconds (1 hour) — data won't be re-fetched on every Streamlit rerun
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_ticker_data(ticker: str):
+def fetch_ticker_data(ticker: str, start_date, end_date):
     """Fetch all yfinance data for a ticker. Cached for 1 hour."""
     for attempt in range(3):
         try:
             stock = yf.Ticker(ticker)
 
-            history_df = safe_df(stock.history(period="1y"))
+            history_df = safe_df(
+                stock.history(
+                    start=start_date,
+                    end=end_date
+                )
+            )
             if not history_df.empty:
-                try:
-                    history_df.index = history_df.index.tz_localize(None)
-                except Exception:
+                if isinstance(history_df.index, pd.DatetimeIndex) and history_df.index.tz is not None:
                     history_df.index = history_df.index.tz_convert(None)
                 history_df = history_df.sort_index(ascending=False)
 
             balance_sheet_df = safe_df(stock.balance_sheet)
             financials_df    = safe_df(stock.financials)
             cashflow_df      = safe_df(stock.cashflow)
-            info             = stock.info or {}
+            info = stock.info if isinstance(stock.info, dict) else {}
 
             return {
                 "history":       history_df,
@@ -418,7 +421,7 @@ def make_price_chart(history_df, ticker):
         marker_color="rgba(105,240,174,0.25)"
     ))
     fig.update_layout(
-        title=f"{ticker} — 1 Year Price & Volume",
+        title=f"{ticker} — Historical Price & Volume",
         paper_bgcolor="#0a0e1a", plot_bgcolor="#0f1626",
         font=dict(family="Syne", color="#e8eaf0"),
         xaxis=dict(gridcolor="#1e2d4a", showgrid=True),
@@ -513,6 +516,7 @@ with st.sidebar:
     include_charts   = st.checkbox("Show Charts in App",    value=True)
 
     fetch_btn = st.button("⚡ Fetch & Export", use_container_width=True)
+    tickers = []
 
     st.markdown("---")
     st.markdown("""
@@ -523,51 +527,108 @@ with st.sidebar:
     ⚡ Data cached for 1 hour<br>
     </div>
     """, unsafe_allow_html=True)
+    # ===== HISTORICAL DURATION =====
+    st.markdown("---")
+    st.markdown("**Historical Data Duration**")
 
-# ========== MAIN AREA ==========
-st.markdown("""
-<div class='fin-header'>
-    <h1>FinScraper</h1>
-    <p>YAHOO FINANCE DATA EXPORTER &nbsp;·&nbsp; EXCEL + CHARTS</p>
-</div>
-""", unsafe_allow_html=True)
+    duration = st.selectbox(
+        "Select Duration",
+        ["1M", "3M", "6M", "1Y", "3Y", "5Y", "6Y", "10Y", "MAX", "CUSTOM"],
+        index=3
+    )
 
-if not fetch_btn:
-    col1, col2, col3 = st.columns(3)
-    for col, icon, title, desc in [
-        (col1, "📥", "Excel Export", "All sheets: Price History, Balance Sheet, Income Statement, Cashflow, Key Statistics, Analysis"),
-        (col2, "📈", "Interactive Charts", "1-year price & volume, Revenue & Profit, Balance Sheet visualized with Plotly"),
-        (col3, "🌍", "Global Tickers", "Supports US, Indian (NSE/BSE), and all Yahoo Finance listed stocks"),
-    ]:
-        with col:
-            st.markdown(f"""
-            <div class='metric-card' style='text-align:center; padding: 2rem 1rem;'>
-                <div style='font-size:2rem; margin-bottom:0.8rem;'>{icon}</div>
-                <div style='font-family:Syne,sans-serif; font-weight:700; font-size:1rem;
-                            color:#e8eaf0; margin-bottom:0.5rem;'>{title}</div>
-                <div style='font-family:Space Mono,monospace; font-size:0.72rem;
-                            color:#5a7a9a; line-height:1.6;'>{desc}</div>
-            </div>
-            """, unsafe_allow_html=True)
+    today = date.today()
+    start_date = today - timedelta(days=365)
+    end_date = today
 
+    if duration == "1M":
+        start_date = today - timedelta(days=30)
+
+    elif duration == "3M":
+        start_date = today - timedelta(days=90)
+
+    elif duration == "6M":
+        start_date = today - timedelta(days=180)
+
+    elif duration == "1Y":
+        start_date = today - timedelta(days=365)
+
+    elif duration == "3Y":
+        start_date = today - timedelta(days=365 * 3)
+
+    elif duration == "5Y":
+        start_date = today - timedelta(days=365 * 5)
+
+    elif duration == "6Y":
+        start_date = today - timedelta(days=365 * 6)
+
+    elif duration == "10Y":
+        start_date = today - timedelta(days=365 * 10)
+
+    elif duration == "MAX":
+        start_date = date(1900, 1, 1)
+
+    # ===== CUSTOM DATE RANGE =====
+    if duration == "CUSTOM":
+
+        start_date = st.date_input(
+            "Start Date",
+            value=today - timedelta(days=365)
+        )
+
+        end_date = st.date_input(
+            "End Date",
+            value=today
+        )
+
+    else:
+        end_date = today
+
+    st.caption(f"Selected Range: {start_date} → {end_date}")
+    # ========== MAIN AREA ==========
     st.markdown("""
-    <div style='margin-top:3rem; text-align:center; font-family:Space Mono,monospace;
-                font-size:0.8rem; color:#3a5a7a;'>
-        ← Enter tickers in the sidebar and click Fetch & Export
+    <div class='fin-header'>
+        <h1>FinScraper</h1>
+        <p>YAHOO FINANCE DATA EXPORTER &nbsp;·&nbsp; EXCEL + CHARTS</p>
     </div>
     """, unsafe_allow_html=True)
 
-else:
-    tickers = [t.strip().upper() for t in ticker_input.replace(",", "\n").splitlines() if t.strip()]
-    if not tickers:
-        st.error("Please enter at least one ticker symbol.")
-        st.stop()
+    if not fetch_btn:
+        col1, col2, col3 = st.columns(3)
+        for col, icon, title, desc in [
+            (col1, "📥", "Excel Export", "All sheets: Price History, Balance Sheet, Income Statement, Cashflow, Key Statistics, Analysis"),
+            (col2, "📈", "Interactive Charts", "1-year price & volume, Revenue & Profit, Balance Sheet visualized with Plotly"),
+            (col3, "🌍", "Global Tickers", "Supports US, Indian (NSE/BSE), and all Yahoo Finance listed stocks"),
+        ]:
+            with col:
+                st.markdown(f"""
+                <div class='metric-card' style='text-align:center; padding: 2rem 1rem;'>
+                    <div style='font-size:2rem; margin-bottom:0.8rem;'>{icon}</div>
+                    <div style='font-family:Syne,sans-serif; font-weight:700; font-size:1rem;
+                                color:#e8eaf0; margin-bottom:0.5rem;'>{title}</div>
+                    <div style='font-family:Space Mono,monospace; font-size:0.72rem;
+                                color:#5a7a9a; line-height:1.6;'>{desc}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
-    st.markdown(
-        "**Fetching:** " + " ".join([f"<span class='ticker-badge'>{t}</span>" for t in tickers]),
-        unsafe_allow_html=True
-    )
-    st.markdown("")
+        st.markdown("""
+        <div style='margin-top:3rem; text-align:center; font-family:Space Mono,monospace;
+                    font-size:0.8rem; color:#3a5a7a;'>
+            ← Enter tickers in the sidebar and click Fetch & Export
+        </div>
+        """, unsafe_allow_html=True)
+
+    else:
+        tickers = [t.strip().upper() for t in ticker_input.replace(",", "\n").splitlines() if t.strip()]
+        if not tickers:
+            st.error("Please enter at least one ticker symbol.")
+            st.stop()
+
+        st.markdown(
+            "**Fetching:** " + " ".join([f"<span class='ticker-badge'>{t}</span>" for t in tickers]),
+            unsafe_allow_html=True
+        )
+        st.markdown("")
 
     for idx, ticker in enumerate(tickers):
         st.markdown(f"<div class='section-title'>📌 {ticker}</div>", unsafe_allow_html=True)
@@ -588,7 +649,11 @@ else:
             )
 
             # ── Cached yfinance call ──
-            result = fetch_ticker_data(ticker)
+            result = fetch_ticker_data(
+                ticker,
+                start_date,
+                end_date
+            )
 
             if result.get("error"):
                 log.markdown(
@@ -598,11 +663,21 @@ else:
                 st.markdown("<br>", unsafe_allow_html=True)
                 continue
 
-            history_df       = result["history"]
-            balance_sheet_df = result["balance_sheet"]
-            financials_df    = result["financials"]
-            cashflow_df      = result["cashflow"]
-            info             = result["info"]
+            history_df       = result.get("history")
+            if not isinstance(history_df, pd.DataFrame):
+                history_df = pd.DataFrame()
+            balance_sheet_df = result.get("balance_sheet")
+            if not isinstance(balance_sheet_df, pd.DataFrame):
+                balance_sheet_df = pd.DataFrame()
+            financials_df    = result.get("financials")
+            if not isinstance(financials_df, pd.DataFrame):
+                financials_df = pd.DataFrame()
+            cashflow_df      = result.get("cashflow")
+            if not isinstance(cashflow_df, pd.DataFrame):
+                cashflow_df = pd.DataFrame()
+            info = result.get("info")
+            if not isinstance(info, dict):
+                info = {}
 
             log.markdown(
                 f"<div class='status-box'>⏳ Scraping Key Statistics page for {ticker}...</div>",
@@ -674,7 +749,11 @@ else:
                 balance_sheet_df, financials_df, cashflow_df,
                 yahoo_stats_sections, yahoo_analysis_sections
             )
-            fname = f"{ticker.replace('.','_')}_YahooFinance_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            fname = (
+                f"{ticker.replace('.','_')}_"
+                f"{start_date}_to_{end_date}_"
+                f"{datetime.now().strftime('%Y%m%d')}.xlsx"
+            )
             st.download_button(
                 label=f"⬇️  Download {ticker} Excel",
                 data=excel_buf,
