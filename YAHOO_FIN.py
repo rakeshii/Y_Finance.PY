@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import yfinance as yf
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 # ================= CONFIG =================
 EXPORT_DIR = "exports"
@@ -13,6 +13,23 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 # ================= UTILITIES =================
 def safe_df(df):
     return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+
+def remove_timezone(df):
+
+    if df.empty:
+        return df
+
+    # Remove timezone from index
+    if hasattr(df.index, 'tz') and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    # Remove timezone from datetime columns
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].dt.tz_localize(None)
+
+    return df
 
 
 # ================= YAHOO API =================
@@ -39,7 +56,6 @@ def fetch_yahoo_statistics(ticker):
         r = requests.get(url, headers=headers, params=params, timeout=10)
         data = r.json()
 
-        # Safe checks
         if "quoteSummary" not in data:
             return pd.DataFrame()
 
@@ -65,19 +81,26 @@ def fetch_yahoo_statistics(ticker):
                     "Category": module
                 })
 
-        df = pd.DataFrame(rows)
-
-        return df
+        return pd.DataFrame(rows)
 
     except Exception as e:
         st.error(f"Yahoo API error: {e}")
         return pd.DataFrame()
+
+
 # ================= EXPORT FUNCTION =================
-def fetch_and_export(ticker):
+def fetch_and_export(ticker, start_date, end_date):
 
     stock = yf.Ticker(ticker)
 
-    history = safe_df(stock.history(period="1y"))
+    # Historical Data using Calendar Dates
+    history = safe_df(
+        stock.history(
+            start=start_date,
+            end=end_date
+        )
+    )
+
     balance = safe_df(stock.balance_sheet)
     income = safe_df(stock.financials)
     cashflow = safe_df(stock.cashflow)
@@ -94,22 +117,27 @@ def fetch_and_export(ticker):
         # Price History
         if not history.empty:
             history = history.sort_index(ascending=False)
+            history = remove_timezone(history)
             history.to_excel(writer, sheet_name="Price_History")
 
         # Balance Sheet
         if not balance.empty:
+            balance = remove_timezone(balance)
             balance.to_excel(writer, sheet_name="Balance_Sheet")
 
         # Income Statement
         if not income.empty:
+            income = remove_timezone(income)
             income.to_excel(writer, sheet_name="Income_Statement")
 
         # Cashflow
         if not cashflow.empty:
+            cashflow = remove_timezone(cashflow)
             cashflow.to_excel(writer, sheet_name="Cashflow")
 
-        # Key Statistics
+        # Statistics
         if not stats.empty:
+            stats = remove_timezone(stats)
             stats.to_excel(writer, sheet_name="Key_Statistics", index=False)
 
     return filepath
@@ -123,34 +151,67 @@ st.set_page_config(
 
 st.title("📊 Yahoo Finance Financial Data Exporter")
 
-st.write("Fetch financial statements and key statistics from Yahoo Finance.")
+st.write("Fetch financial statements and historical data from Yahoo Finance.")
 
+# -------- Ticker Input --------
 ticker = st.text_input(
     "Enter Company Ticker",
     placeholder="Example: RELIANCE.NS or AAPL"
 )
 
+# -------- Date Selection --------
+st.subheader("📅 Select Historical Data Duration")
+
+default_end = date.today()
+default_start = default_end - timedelta(days=365)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    start_date = st.date_input(
+        "Start Date",
+        value=default_start
+    )
+
+with col2:
+    end_date = st.date_input(
+        "End Date",
+        value=default_end
+    )
+
+# -------- Fetch Button --------
 if st.button("Fetch & Export Data"):
 
     if ticker:
 
-        with st.spinner("Fetching data from Yahoo Finance..."):
+        if start_date >= end_date:
+            st.error("Start Date must be before End Date.")
 
-            try:
-                filepath = fetch_and_export(ticker.upper())
+        else:
 
-                st.success("Data exported successfully!")
+            with st.spinner("Fetching data from Yahoo Finance..."):
 
-                with open(filepath, "rb") as f:
-                    st.download_button(
-                        label="📥 Download Excel File",
-                        data=f,
-                        file_name=os.path.basename(filepath),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                try:
+
+                    filepath = fetch_and_export(
+                        ticker.upper(),
+                        start_date,
+                        end_date
                     )
 
-            except Exception as e:
-                st.error(f"Error: {e}")
+                    st.success("Data exported successfully!")
+
+                    with open(filepath, "rb") as f:
+
+                        st.download_button(
+                            label="📥 Download Excel File",
+                            data=f,
+                            file_name=os.path.basename(filepath),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     else:
         st.warning("Please enter a valid ticker.")
